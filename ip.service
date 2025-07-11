@@ -1,0 +1,16 @@
+[Unit]
+Description=IP IsHere Service
+After=network.target
+
+[Service]
+Type=simple
+User=admin
+Group=admin
+WorkingDirectory=/home/admin
+ExecStart=/home/admin/ip.ishere.dev-linux-amd64
+Environment=IP_CONFIG_FILE=/home/admin/app/config.yaml
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
