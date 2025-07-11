@@ -80,10 +80,56 @@ sudo setcap cap_net_bind_service=+ep ip.ishere.dev-linux-amd64
 
 echo -e "${YELLOW}Starting application...${NC}"
 
-# Start the application
-if [ -f ip.ishere.dev-linux-amd64 ]; then
-    IP_CONFIG_FILE=$(realpath app/config.yaml) ip.ishere.dev-linux-amd64
+check_systemd_service() {
+    local service_file="/etc/systemd/system/ip.service"
+
+    # Check if service file exists
+    if [[ ! -f "$service_file" ]]; then
+        echo -e "${YELLOW}ip.service not found at $service_file${NC}"
+        return 1
+    fi
+
+    # Check if systemctl is available
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo -e "${YELLOW}systemctl command not available${NC}"
+        return 1
+    fi
+
+    # Try to reload systemd daemon
+    if ! sudo systemctl daemon-reload 2>/dev/null; then
+        echo -e "${YELLOW}Failed to reload systemd daemon${NC}"
+        return 1
+    fi
+
+    return 0
+}
+
+# Try to use systemd service first
+if check_systemd_service; then
+    echo -e "${GREEN}Found ip.service. Starting via systemd...${NC}"
+
+    # Start the service
+    if sudo systemctl start ip.service; then
+        echo -e "${GREEN}Service started successfully${NC}"
+
+        # Enable the service for auto-start
+        if sudo systemctl enable ip.service; then
+            echo -e "${GREEN}Service enabled for auto-start${NC}"
+        else
+            echo -e "${YELLOW}Warning: Failed to enable service for auto-start${NC}"
+        fi
+
+        # Show service status
+        echo -e "${GREEN}Service status:${NC}"
+        sudo systemctl status ip.service --no-pager
+    else
+        echo -e "${RED}Failed to start service via systemd. Falling back to direct execution...${NC}"
+        # Fallback to direct execution
+        IP_CONFIG_FILE=$(realpath app/config.yaml) /home/admin/ip.ishere.dev-linux-amd64
+    fi
+else
+    echo -e "${YELLOW}Using direct execution method...${NC}"
+    # Fallback to direct execution
+    IP_CONFIG_FILE=$(realpath app/config.yaml) /home/admin/ip.ishere.dev-linux-amd64
 fi
-if [ -f bin/ip.ishere.dev-linux-amd64 ]; then
-    IP_CONFIG_FILE=$(realpath app/config.yaml) bin/ip.ishere.dev-linux-amd64
-fi
+
