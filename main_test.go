@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/andreimerlescu/figtree/v2"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -16,7 +17,9 @@ func TestVersion(t *testing.T) {
 func TestGetClientIP(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("X-Forwarded-For", "192.0.2.1, 2001:db8::1")
-	ipv4, ipv6 := getClientIP(req)
+	figs := figtree.With(figtree.Options{Germinate: true, Tracking: false})
+	figs = configure(figs)
+	ipv4, ipv6 := getClientIP(figs, req)
 	if ipv4 != "192.0.2.1" || ipv6 != "2001:db8::1" {
 		t.Errorf("Expected IPv4:192.0.2.1 IPv6:2001:db8::1, got %s %s", ipv4, ipv6)
 	}
