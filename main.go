@@ -1,12 +1,15 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"database/sql"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -16,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,15 +27,38 @@ import (
 	"github.com/andreimerlescu/checkfs/file"
 	"github.com/andreimerlescu/figtree/v2"
 	"github.com/go-ini/ini"
+	"github.com/google/uuid"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
+
+//go:embed VERSION
+var versionBytes embed.FS
+
+var currentVersion string
+
+func Version() string {
+	if len(currentVersion) == 0 {
+		versionBytes, err := versionBytes.ReadFile("VERSION")
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "failed to read embedded VERSION file: %v", err.Error())
+			return "v0.0.0"
+		}
+		currentVersion = strings.TrimSpace(string(versionBytes))
+	}
+	return currentVersion
+}
 
 type IPData struct {
 	IPv4       string
 	IPv6       string
 	VisitCount int
 	LastVisit  string
+	TotalHits  int64
 }
 
 type IPResponse struct {
@@ -41,6 +68,11 @@ type IPResponse struct {
 
 var figs figtree.Plant
 var rateLimiter *RateLimiter
+var hitChan chan time.Time
+var hitWG sync.WaitGroup
+var totalHitsCache atomic.Int64
+var logger *zap.Logger
+var maintenanceMode atomic.Int32
 
 const (
 	AppName     string = "dev.ishere.ip"
@@ -80,6 +112,24 @@ const (
 	argRateLimitWindow      string = "ratelimit_window_seconds"
 	argRateLimitMaxRequests string = "ratelimit_max_requests"
 	argRateLimitCleanup     string = "ratelimit_cleanup_seconds"
+	argVersion              string = "version"
+	argAliasVersion         string = "v"
+	argAbout                string = "about"
+	argAliasAbout           string = "a"
+	argHitBatchSize         string = "hit_batch_size"
+	argHitFlushInterval     string = "hit_flush_interval"
+	argEnvironment          string = "environment"
+)
+
+var (
+	requestsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "http_requests_total",
+		Help: "Total number of HTTP requests",
+	})
+	hitsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "hits_total",
+		Help: "Total hits recorded",
+	})
 )
 
 func main() {
@@ -94,12 +144,20 @@ func main() {
 	figs = figs.NewString(argDomain, "", "Domain Name of App")
 	figs = figs.NewString(argCert, "", "Path to certificate in PEM format")
 	figs = figs.NewString(argKey, "", "Path to certificate private key in PEM format")
+	figs = figs.NewString(argEnvironment, "dev", "Environment of runtime. Options: dev, staging, prod")
 
 	figs = figs.NewInt(argPortUnsecure, 8080, "HTTP port to use")
 	figs = figs.NewInt(argPortSecure, 8443, "HTTPS port to use")
 	figs = figs.NewInt(argConnections, 36, "Database connections to allow")
+	figs = figs.NewInt(argHitBatchSize, 36, "Batch size for summaries")
+
+	figs = figs.NewDuration(argHitFlushInterval, time.Duration(36)*time.Second, "Delay between flushing batches")
 
 	figs = figs.NewBool(argAdvanced, false, "Advanced mode enabled for IP lookup")
+	figs = figs.NewBool(argVersion, false, "Display app current version")
+	figs = figs.NewBool(argAbout, false, "Display app about page")
+	figs = figs.WithAlias(argVersion, argAliasVersion)
+	figs = figs.WithAlias(argAbout, argAliasAbout)
 
 	figs = figs.NewBool(argRateLimitEnabled, true, "Enable rate limiting")
 	figs = figs.NewInt(argRateLimitWindow, 60, "Rate limit window in seconds")
@@ -108,6 +166,7 @@ func main() {
 
 	figs = figs.WithValidator(argDatabase, figtree.AssureStringNotEmpty)
 	figs = figs.WithValidator(argDomain, figtree.AssureStringNotEmpty)
+	figs = figs.WithValidator(argDomain, figtree.AssureStringNoPrefixes([]string{"http://", "https://", "s3://", "op://", "ssh://"}))
 	figs = figs.WithValidator(argDomain, figtree.AssureStringLengthGreaterThan(4))
 	figs = figs.WithValidator(argDomain, figtree.AssureStringLengthLessThan(99))
 	figs = figs.WithValidator(argCert, figtree.AssureStringNotEmpty)
@@ -126,6 +185,26 @@ func main() {
 		log.Fatal(configErr)
 	}
 
+	if *figs.Bool(argAbout) {
+		about()
+		os.Exit(0)
+	}
+
+	if *figs.Bool(argVersion) {
+		fmt.Println(Version())
+		os.Exit(0)
+	}
+
+	if strings.HasPrefix(*figs.String(argEnvironment), "prod") {
+		logger, _ = zap.NewProduction()
+	} else {
+		logger, _ = zap.NewDevelopment()
+	}
+
+	defer func() {
+		ignore(logger.Sync())
+	}()
+
 	// Initialize rate limiter
 	rateLimitConfig := RateLimitConfig{
 		WindowSize:    time.Duration(*figs.Int(argRateLimitWindow)) * time.Second,
@@ -138,7 +217,7 @@ func main() {
 	databasePath := *figs.String(argDatabase)
 	db, err := sql.Open("sqlite3", databasePath+"?_journal_mode=WAL")
 	if err != nil {
-		log.Printf("sql.Open(%s) failed with err: %v", databasePath, err)
+		logger.Error(fmt.Sprintf("sql.Open(%s) failed with err", databasePath), zap.Error(err))
 		log.Fatal(err)
 	}
 	defer func(db *sql.DB) {
@@ -150,10 +229,110 @@ func main() {
 	db.SetMaxIdleConns(connections)
 	db.SetConnMaxLifetime(time.Duration(connections) * time.Second)
 
+	msg := "db.Exec err: "
+
 	_, err = db.Exec(SqlCreateTable)
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal(msg, zap.Error(err))
 	}
+
+	_, err = db.Exec(SqlCreateHitsTable)
+	if err != nil {
+		logger.Fatal(msg, zap.Error(err))
+	}
+
+	_, err = db.Exec(SqlCreateHitSummaryTable)
+	if err != nil {
+		logger.Fatal(msg, zap.Error(err))
+	}
+
+	_, err = db.Exec(SqlIndexes)
+	if err != nil {
+		logger.Fatal(msg, zap.Error(err))
+	}
+
+	hitChan = make(chan time.Time, 1000)
+	go hitConsumer(db, hitChan)
+
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for {
+			<-ticker.C
+			updateCache(db)
+		}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(6 * time.Hour)
+		defer ticker.Stop()
+		for {
+			<-ticker.C
+			updateSummary(db)
+		}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			backupPath := *figs.String("backup_path") // Assume added config as before
+
+			// Enter maintenance mode
+			maintenanceMode.Store(1)
+
+			// Stop hit consumer to flush pending
+			close(hitChan)
+			hitWG.Wait()
+
+			// Close DB
+			if err := db.Close(); err != nil {
+				logger.Error("Failed to close DB for backup", zap.Error(err))
+				// Continue or abort; here continue
+			}
+
+			// Copy .db file (after close, WAL checkpointed)
+			if err := copyFile(databasePath, backupPath); err != nil {
+				logger.Error("DB file copy failed", zap.Error(err))
+				// Reopen DB anyway
+			} else {
+				// Compress
+				if err := gzipFile(backupPath); err != nil {
+					logger.Error("DB backup compression failed", zap.Error(err))
+				}
+			}
+
+			var err error
+			db, err = sql.Open("sqlite3", databasePath+"?_journal_mode=WAL")
+			if err != nil {
+				logger.Fatal("Failed to reopen DB after backup", zap.Error(err))
+			}
+			db.SetMaxOpenConns(connections)
+			db.SetMaxIdleConns(connections)
+			db.SetConnMaxLifetime(time.Duration(connections) * time.Second)
+
+			if _, err = db.Exec(SqlCreateTable); err != nil {
+				logger.Fatal("Re-create table failed", zap.Error(err))
+			}
+			if _, err = db.Exec(SqlCreateHitsTable); err != nil {
+				logger.Fatal("Re-create hits table failed", zap.Error(err))
+			}
+			if _, err = db.Exec(SqlCreateHitSummaryTable); err != nil {
+				logger.Fatal("Re-create summary table failed", zap.Error(err))
+			}
+			if _, err = db.Exec(SqlIndexes); err != nil {
+				logger.Fatal("Re-create indexes failed", zap.Error(err))
+			}
+
+			hitChan = make(chan time.Time, 1000)
+			hitWG.Add(1)
+			go hitConsumer(db, hitChan)
+
+			maintenanceMode.Store(0)
+
+			logger.Info("DB backup completed", zap.String("path", backupPath+".gz"))
+		}
+	}()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", rateLimitMiddleware(GetIP(db)))
@@ -162,8 +341,24 @@ func main() {
 	mux.HandleFunc("/read.yaml", rateLimitMiddleware(GetIP(db)))
 	mux.HandleFunc("/read.ini", rateLimitMiddleware(GetIP(db)))
 	mux.HandleFunc("/stats", GetStats())
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if err := db.Ping(); err != nil {
+			http.Error(w, "Database unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprintln(w, "OK")
+	})
 
-	wrappedMux := wrapNotFound(mux)
+	// Activate Maintenance Middleware
+	wrappedMux := maintenanceMiddleware(mux)
+	// Attach Request ID to each Request
+	wrappedMux = requestIDMiddleware(wrappedMux)
+	// Accept 30s timeout for Requests
+	wrappedMux = timeoutMiddleware(wrappedMux)
+	// Handle 404 Not Found Errors
+	wrappedMux = wrapNotFound(wrappedMux)
 
 	certFile := *figs.String(argCert)
 	if err := checkfs.File(certFile, file.Options{Exists: true}); err != nil {
@@ -204,7 +399,7 @@ func main() {
 		log.Printf("Starting HTTP server on %s", httpPort)
 		err := httpServer.ListenAndServe()
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("HTTP server error: %v", err)
+			logger.Error("HTTP server error: %v", zap.Error(err))
 		}
 	}()
 
@@ -213,17 +408,29 @@ func main() {
 	<-sigChan
 	log.Println("Shutdown signal received")
 
+	close(hitChan)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := httpServer.Shutdown(ctx); err != nil {
-		log.Printf("HTTP shutdown error: %v", err)
+		logger.Error("HTTP shutdown error: %v", zap.Error(err))
 	}
 	if err := httpsServer.Shutdown(ctx); err != nil {
-		log.Printf("HTTPS shutdown error: %v", err)
+		logger.Error("HTTPS shutdown error: %v", zap.Error(err))
 	}
 
-	log.Println("Shutdown complete")
+	logger.Info("Shutdown complete")
+}
+
+func requestIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqID := uuid.New().String()[:8] // Short UUID
+		ctx := context.WithValue(r.Context(), "reqID", reqID)
+		r = r.WithContext(ctx)
+		w.Header().Set("X-Request-ID", reqID)
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Rate limiting middleware
@@ -247,7 +454,9 @@ func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			w.Header().Set("X-RateLimit-Window", fmt.Sprintf("%d", int(rateLimiter.config.WindowSize.Seconds())))
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(rateLimiter.config.WindowSize.Seconds())))
 
-			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+			w.Header().Set(HeadContentType, "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"error": "429"})
+			w.WriteHeader(http.StatusTooManyRequests)
 			return
 		}
 
@@ -306,8 +515,16 @@ func wrapNotFound(next http.Handler) http.Handler {
 	})
 }
 
+func timeoutMiddleware(next http.Handler) http.Handler {
+	return http.TimeoutHandler(next, 10*time.Second, "Request timed out")
+}
+
 func GetIP(db *sql.DB) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
+		hitChan <- time.Now().UTC()
+		requestsTotal.Inc()
+		hitsTotal.Inc()
+
 		var ipv4, ipv6 string
 		if *figs.Bool(argAdvanced) {
 			ipv4, ipv6 = getClientIPAdvanced(r)
@@ -317,10 +534,14 @@ func GetIP(db *sql.DB) func(w http.ResponseWriter, r *http.Request) {
 
 		data, err := updateRequestTracking(db, ipv4, ipv6)
 		if err != nil {
-			http.Error(w, Err500, http.StatusInternalServerError)
-			log.Printf("Error updating request tracking: %v", err)
+			w.Header().Set("Content-Type", "application/json")
+			ignore(json.NewEncoder(w).Encode(map[string]string{"error": Err500}))
+			w.WriteHeader(http.StatusInternalServerError)
+			logger.Error("Error updating request tracking: %v", zap.Error(err))
 			return
 		}
+
+		data.TotalHits = totalHitsCache.Load()
 
 		isCurl := strings.Contains(strings.ToLower(r.Header.Get(HeadUserAgent)), "curl")
 
@@ -348,28 +569,34 @@ func GetIP(db *sql.DB) func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set(HeadContentType, "text/html")
 				tmpl := template.Must(template.New("index").Parse(string(TemplateBytesIndex)))
 				if err := tmpl.Execute(w, data); err != nil {
-					http.Error(w, Err500, http.StatusInternalServerError)
-					log.Printf("Template execute error: %v", err)
+					w.Header().Set("Content-Type", "application/json")
+					ignore(json.NewEncoder(w).Encode(map[string]string{"error": Err500}))
+					w.WriteHeader(http.StatusInternalServerError)
+					logger.Error("Template execute error: %v", zap.Error(err))
 				}
 			}
 			return
 		case "json":
 			w.Header().Set(HeadContentType, "application/json")
 			if err := json.NewEncoder(w).Encode(IPResponse{IPv4: data.IPv4, IPv6: data.IPv6}); err != nil {
-				http.Error(w, Err500, http.StatusInternalServerError)
-				log.Printf("JSON encode error: %v", err)
+				w.Header().Set("Content-Type", "application/json")
+				ignore(json.NewEncoder(w).Encode(map[string]string{"error": Err500}))
+				w.WriteHeader(http.StatusInternalServerError)
+				logger.Error("JSON encode error: %v", zap.Error(err))
 			}
 			return
 		case "yaml":
 			w.Header().Set(HeadContentType, "application/x-yaml")
 			yamlBytes, err := yaml.Marshal(IPResponse{IPv4: data.IPv4, IPv6: data.IPv6})
 			if err != nil {
-				http.Error(w, Err500, http.StatusInternalServerError)
-				log.Printf("YAML marshal error: %v", err)
+				w.Header().Set("Content-Type", "application/json")
+				ignore(json.NewEncoder(w).Encode(map[string]string{"error": Err500}))
+				w.WriteHeader(http.StatusInternalServerError)
+				logger.Error("YAML marshal error: %v", zap.Error(err))
 				return
 			}
 			if _, err := w.Write(yamlBytes); err != nil {
-				log.Printf("Write error: %v", err)
+				logger.Error("Write error: %v", zap.Error(err))
 			}
 			return
 		case "ini":
@@ -377,23 +604,31 @@ func GetIP(db *sql.DB) func(w http.ResponseWriter, r *http.Request) {
 			cfg := ini.Empty()
 			sec, err := cfg.NewSection("ip")
 			if err != nil {
-				http.Error(w, Err500, http.StatusInternalServerError)
-				log.Printf("INI section error: %v", err)
+				w.Header().Set("Content-Type", "application/json")
+				ignore(json.NewEncoder(w).Encode(map[string]string{"error": Err500}))
+				w.WriteHeader(http.StatusInternalServerError)
+				logger.Error("INI section error: %v", zap.Error(err))
 				return
 			}
 			if _, err := sec.NewKey("ipv4", data.IPv4); err != nil {
-				http.Error(w, Err500, http.StatusInternalServerError)
-				log.Printf("INI key error: %v", err)
+				w.Header().Set("Content-Type", "application/json")
+				ignore(json.NewEncoder(w).Encode(map[string]string{"error": Err500}))
+				w.WriteHeader(http.StatusInternalServerError)
+				logger.Error("INI key error: %v", zap.Error(err))
 				return
 			}
 			if _, err := sec.NewKey("ipv6", data.IPv6); err != nil {
-				http.Error(w, Err500, http.StatusInternalServerError)
-				log.Printf("INI key error: %v", err)
+				w.Header().Set("Content-Type", "application/json")
+				ignore(json.NewEncoder(w).Encode(map[string]string{"error": Err500}))
+				w.WriteHeader(http.StatusInternalServerError)
+				logger.Error("INI key error: %v", zap.Error(err))
 				return
 			}
 			if _, err := cfg.WriteTo(w); err != nil {
-				http.Error(w, Err500, http.StatusInternalServerError)
-				log.Printf("INI write error: %v", err)
+				w.Header().Set("Content-Type", "application/json")
+				ignore(json.NewEncoder(w).Encode(map[string]string{"error": Err500}))
+				w.WriteHeader(http.StatusInternalServerError)
+				logger.Error("INI write error: %v", zap.Error(err))
 			}
 			return
 		}
@@ -538,6 +773,10 @@ func updateRequestTracking(db *sql.DB, ipv4, ipv6 string) (IPData, error) {
 		return data, nil
 	}
 
+	if parsedIP := net.ParseIP(ip); parsedIP != nil {
+		ip = parsedIP.String()
+	}
+
 	tx, err := db.Begin()
 	if err != nil {
 		return data, ErrDatabase{"db.Begin()", err}
@@ -638,7 +877,11 @@ type ErrCommit struct {
 }
 
 func (e ErrCommit) Error() string {
-	return fmt.Sprintf("tx.Commit(%s) threw: %v")
+	return fmt.Sprintf("tx.Commit() threw: %v", e.Err)
+}
+
+func (e ErrCommit) Unwrap() error {
+	return e.Err
 }
 
 const (
@@ -656,6 +899,33 @@ const (
 			last_visit TEXT
 		)
 	`
+	SqlIndexes string = `
+		CREATE INDEX IF NOT EXISTS idx_hits_date ON hits(year, month, day);
+		CREATE INDEX IF NOT EXISTS idx_requests_last_visit ON requests(last_visit);
+	`
+	SqlQueryFindHitsByYearMonth string = `
+		SELECT year, month, SUM(hits) FROM hits GROUP BY year, month
+	`
+	SqlCreateHitsTable string = `
+		CREATE TABLE IF NOT EXISTS hits (
+			year INTEGER,
+			month INTEGER,
+			day INTEGER,
+			hour INTEGER,
+			minute INTEGER,
+			hits INTEGER,
+			PRIMARY KEY (year, month, day, hour, minute)
+		)
+	`
+	SqlCreateHitSummaryTable string = `
+		CREATE TABLE IF NOT EXISTS hit_summary (
+			year INTEGER,
+			month INTEGER,
+			hits INTEGER,
+			last_calculated_on TEXT,
+			PRIMARY KEY (year, month)
+		)
+	`
 	SqlFindLatest string = `
 		SELECT count, last_visit 
 		FROM requests 
@@ -670,6 +940,20 @@ const (
 		SET count = ?, last_visit = ? 
 		WHERE ip = ?
 	`
+	SqlNewHitSummary = `
+		INSERT OR REPLACE INTO hit_summary 
+			(year, month, hits, last_calculated_on) 
+		VALUES (?, ?, ?, ?)
+	`
+	SqlFindTotalHits = `
+		SELECT COALESCE(SUM(hits), 0) FROM hits
+	`
+	SqlFlushBatchBase = `
+		INSERT INTO hits (year, month, day, hour, minute, hits) VALUES 
+	`
+	SqlFlushBatchSecond = `
+		ON CONFLICT(year, month, day, hour, minute) DO UPDATE SET hits = hits + excluded.hits
+    `
 	TemplateBytesIndex = `
 		<!DOCTYPE html>
 		<html lang="en" aria-description="your internet protocol address finder">
@@ -682,6 +966,7 @@ const (
 				<p>IPv6: {{.IPv6}}</p>
 				<p>Visit Count: {{.VisitCount}}</p>
 				<p>Last Visit: {{.LastVisit}}</p>
+				<p>Total Hits: {{.TotalHits}}</p>
 			</body>
 		</html>
 	`
@@ -714,7 +999,6 @@ type RateLimitStats struct {
 	TotalRequests   int64
 	BlockedRequests int64
 	ActiveClients   int64
-	mu              sync.RWMutex
 }
 
 func NewRateLimiter(config RateLimitConfig) *RateLimiter {
@@ -763,10 +1047,8 @@ func (rl *RateLimiter) IsAllowed(ip string) bool {
 	now := time.Now()
 
 	// Update stats
-	rl.stats.mu.Lock()
-	rl.stats.TotalRequests++
-	rl.stats.ActiveClients = int64(len(rl.clients))
-	rl.stats.mu.Unlock()
+	atomic.AddInt64(&rl.stats.TotalRequests, 1)
+	atomic.StoreInt64(&rl.stats.ActiveClients, int64(len(rl.clients)))
 
 	record, exists := rl.clients[ip]
 	if !exists {
@@ -798,9 +1080,7 @@ func (rl *RateLimiter) IsAllowed(ip string) bool {
 			record.BlockedAt = now
 
 			// Update blocked stats
-			rl.stats.mu.Lock()
-			rl.stats.BlockedRequests++
-			rl.stats.mu.Unlock()
+			atomic.AddInt64(&rl.stats.BlockedRequests, 1)
 
 			log.Printf("Rate limit exceeded for IP: %s (count: %d)", ip, record.Count)
 		}
@@ -811,31 +1091,203 @@ func (rl *RateLimiter) IsAllowed(ip string) bool {
 }
 
 func (rl *RateLimiter) GetStats() RateLimitStats {
-	rl.stats.mu.RLock()
-	defer rl.stats.mu.RUnlock()
-
 	return RateLimitStats{
-		TotalRequests:   rl.stats.TotalRequests,
-		BlockedRequests: rl.stats.BlockedRequests,
-		ActiveClients:   rl.stats.ActiveClients,
+		TotalRequests:   atomic.LoadInt64(&rl.stats.TotalRequests),
+		BlockedRequests: atomic.LoadInt64(&rl.stats.BlockedRequests),
+		ActiveClients:   atomic.LoadInt64(&rl.stats.ActiveClients),
 	}
 }
 
-func (rl *RateLimiter) GetClientInfo(ip string) (*ClientRecord, bool) {
-	rl.mu.RLock()
-	defer rl.mu.RUnlock()
+func about() {
+	fmt.Printf("%s %s\n", AppName, Version())
+	domain := fmt.Sprintf("https://%s", *figs.String(argDomain))
+	format := "\t%s%s%s\n"
+	fmt.Printf("%s\n", "CURL Usage:")
+	fmt.Printf("\t%s%s\n", `curl -s -L `, domain)
+	fmt.Printf(format, `curl -sL`, domain, `/read.ini`)
+	fmt.Printf(format, `curl -sL `, domain, `/read.json`)
+	fmt.Printf(format, `curl -sL `, domain, `/read.yaml`)
+	fmt.Printf(format, `curl -sL `, domain, `/read.json | jq -r '.ipv4'`)
+	fmt.Printf(format, `curl -sL `, domain, ` | grep IPv4 | awk '{print $2}'`)
+	fmt.Println("")
+}
 
-	record, exists := rl.clients[ip]
-	if !exists {
-		return nil, false
+func hitConsumer(db *sql.DB, ch chan time.Time) {
+	batchSize := *figs.Int(argHitBatchSize)
+	flushInterval := *figs.Duration(argHitFlushInterval) * time.Second
+
+	var batch []time.Time
+	timer := time.NewTimer(flushInterval)
+	defer timer.Stop()
+
+	for {
+		select {
+		case t, ok := <-ch:
+			if !ok {
+				if len(batch) > 0 {
+					flushBatch(db, batch)
+				}
+				return
+			}
+			batch = append(batch, t)
+			if len(batch) >= batchSize {
+				flushBatch(db, batch)
+				batch = batch[:0]
+				timer.Reset(flushInterval)
+			}
+		case <-timer.C:
+			if len(batch) > 0 {
+				flushBatch(db, batch)
+				batch = batch[:0]
+			}
+			timer.Reset(flushInterval)
+		}
+	}
+}
+
+func flushBatch(db *sql.DB, batch []time.Time) {
+	if len(batch) == 0 {
+		return
 	}
 
-	// Return a copy to avoid race conditions
-	return &ClientRecord{
-		Count:     record.Count,
-		Window:    record.Window,
-		LastSeen:  record.LastSeen,
-		Blocked:   record.Blocked,
-		BlockedAt: record.BlockedAt,
-	}, true
+	var placeholders []string
+	var args []interface{}
+
+	for _, t := range batch {
+		t = t.UTC()
+		year, mon, day := t.Date()
+		hour, minutes, _ := t.Clock()
+
+		placeholders = append(placeholders, "(?, ?, ?, ?, ?, 1)")
+		args = append(args, year, int(mon), day, hour, minutes)
+	}
+
+	query := SqlFlushBatchBase + strings.Join(placeholders, ", ") + SqlFlushBatchSecond
+
+	tx, err := db.Begin()
+	if err != nil {
+		logger.Error("flushBatch db.Begin error", zap.Error(err))
+		return
+	}
+
+	_, err = tx.Exec(query, args...)
+	if err != nil {
+		logger.Error("flushBatch tx.Exec error", zap.Error(err))
+		if rbErr := tx.Rollback(); rbErr != nil {
+			logger.Error("flushBatch tx.Rollback error", zap.Error(err))
+		}
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		logger.Error("flushBatch tx.Commit error", zap.Error(err))
+	}
+}
+
+func updateCache(db *sql.DB) {
+	var total int64
+	err := db.QueryRow(SqlFindTotalHits).Scan(&total)
+	if err != nil {
+		logger.Error("updateCache QueryRow error", zap.Error(err))
+		return
+	}
+	totalHitsCache.Store(total)
+}
+
+func updateSummary(db *sql.DB) {
+	rows, err := db.Query(SqlQueryFindHitsByYearMonth)
+	if err != nil {
+		logger.Error("updateSummary QueryRow error", zap.Error(err))
+		return
+	}
+	defer rows.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		logger.Error("updateSummary db.Begin error", zap.Error(err))
+		return
+	}
+
+	stmt, err := tx.Prepare(SqlNewHitSummary)
+	if err != nil {
+		logger.Error("updateSummary tx.Prepare error", zap.Error(err))
+		if rbErr := tx.Rollback(); rbErr != nil {
+			logger.Error("updateSummary tx.Rollback error", zap.Error(rbErr))
+		}
+		return
+	}
+	defer func() {
+		ignore(stmt.Close())
+	}()
+
+	nowStr := time.Now().UTC().Format(time.RFC3339)
+
+	for rows.Next() {
+		var year, month, hits int
+		if err := rows.Scan(&year, &month, &hits); err != nil {
+			logger.Error("updateSummary rows.Scan error", zap.Error(err))
+			continue
+		}
+		_, err = stmt.Exec(year, month, hits, nowStr)
+		if err != nil {
+			logger.Error("updateSummary stmt.Exec error", zap.Error(err))
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		logger.Error("updateSummary tx.Commit error", zap.Error(err))
+	}
+}
+
+func maintenanceMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if maintenanceMode.Load() == 1 {
+			w.Header().Set("Retry-After", "60") // Suggest retry in 1 min
+			w.WriteHeader(http.StatusServiceUnavailable)
+			var err error
+			_, err = fmt.Fprintln(w, "Service temporarily unavailable due to maintenance")
+			if err != nil {
+				logger.Error("fmt.Fprintln err: ", zap.Error(err))
+			}
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer ignore(in.Close())
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer ignore(out.Close())
+
+	_, err = io.Copy(out, in)
+	return err
+}
+
+func gzipFile(path string) error {
+	in, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer ignore(in.Close())
+
+	out, err := os.Create(path + ".gz")
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	gz := gzip.NewWriter(out)
+	defer ignore(gz.Close())
+
+	_, err = io.Copy(gz, in)
+	return err
 }
