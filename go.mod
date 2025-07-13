@@ -5,6 +5,7 @@ go 1.24
 require (
 	github.com/andreimerlescu/checkfs v1.0.4 // indirect
 	github.com/andreimerlescu/figtree/v2 v2.0.14 // indirect
+	github.com/andreimerlescu/sema v1.0.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/go-ini/ini v1.67.0 // indirect

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/andreimerlescu/sema"
 	"html/template"
 	"io"
 	"log"
@@ -169,6 +170,7 @@ const (
 	argShutdownTimeout      string = "shutdown_timeout"
 	argRequestTimeout       string = "request_timeout"
 	argTrustedProxies       string = "trusted-proxies"
+	argMaxConcurrency       string = "max-concurrency"
 )
 
 type (
@@ -254,6 +256,7 @@ var (
 			fmt.Printf("ignore(%s)", in)
 		}
 	}
+	concurrency           sema.Semaphore
 	defaultTrustedProxies = []string{
 		"127.0.0.1/32",
 		"10.0.0.0/8",
@@ -310,6 +313,8 @@ func main() {
 	} else {
 		logger, _ = zap.NewDevelopment()
 	}
+
+	concurrency = sema.New(*figs.Int(argMaxConcurrency))
 
 	defer func() {
 		ignore(logger.Sync())
@@ -533,6 +538,12 @@ func mux(figs figtree.Plant, db *sql.DB) http.Handler {
 
 func GetIP(figs figtree.Plant, db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if concurrency != nil {
+			concurrency.Acquire()
+			defer func() {
+				concurrency.Release()
+			}()
+		}
 		hitChan <- time.Now().UTC()
 		requestsTotal.Inc()
 		hitsTotal.Inc()
@@ -657,6 +668,12 @@ func GetIP(figs figtree.Plant, db *sql.DB) http.HandlerFunc {
 
 func GetHealth(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if concurrency != nil {
+			concurrency.Acquire()
+			defer func() {
+				concurrency.Release()
+			}()
+		}
 		if err := db.Ping(); err != nil {
 			http.Error(w, "Database unavailable", http.StatusServiceUnavailable)
 			return
@@ -669,6 +686,12 @@ func GetHealth(db *sql.DB) http.HandlerFunc {
 
 func GetStats() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if concurrency != nil {
+			concurrency.Acquire()
+			defer func() {
+				concurrency.Release()
+			}()
+		}
 		stats := rateLimiter.GetStats()
 
 		response := map[string]interface{}{
@@ -1462,8 +1485,10 @@ func configure(figs figtree.Plant) figtree.Plant {
 	figs = figs.NewInt64(argShutdownTimeout, int64(10), "Millisecond to delay shutdown timeouts")
 	figs = figs.NewInt64(argRequestTimeout, int64(30), "Millisecond to delay request timeouts")
 	figs = figs.NewList(argTrustedProxies, defaultTrustedProxies, "List of Trusted Proxies for HTTP/HTTPS Server")
+	figs = figs.NewInt(argMaxConcurrency, 369, "Maximum number of requests permitted at a time")
 
 	// Configuration Validation
+	figs = figs.WithValidator(argMaxConcurrency, figtree.AssureIntInRange(17, 63_369))
 	figs = figs.WithValidator(argShutdownTimeout, figtree.AssureInt64InRange(36, 36_369_369))
 	figs = figs.WithValidator(argShutdownTimeout, figtree.AssureInt64InRange(36, 36_369_369))
 	figs = figs.WithValidator(argRequestTimeout, figtree.AssureInt64InRange(36, 36_369_369))

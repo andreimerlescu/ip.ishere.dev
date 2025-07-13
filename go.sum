@@ -2,6 +2,8 @@ github.com/andreimerlescu/checkfs v1.0.4 h1:pRXZGW1sfe+yXyWNUxmPC2IiX5yT3vF1V5O8
 github.com/andreimerlescu/checkfs v1.0.4/go.mod h1:ADaqjiRJf3gmyENLS3v9bJIaEH00IOeM48cXxVwy1JY=
 github.com/andreimerlescu/figtree/v2 v2.0.14 h1:pwDbHpfiAdSnaNnxyV2GpG1rG9cmGiHhjXOvBEoVj2w=
 github.com/andreimerlescu/figtree/v2 v2.0.14/go.mod h1:PymPGUzzP/UuxZ4mqC5JIrDZJIVcjZ3GMc/MC2GB6Ek=
+github.com/andreimerlescu/sema v1.0.0 h1:8ai/kqAci7QKUenAJWX13aYtWpjvD0CQW39CFzNIRQs=
+github.com/andreimerlescu/sema v1.0.0/go.mod h1:VCRQkKVknOKKPtAqvrNHL7hxxfoX5O7it2lWBzVxUs0=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
